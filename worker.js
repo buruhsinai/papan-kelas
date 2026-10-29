@@ -16,11 +16,11 @@ export class Room {
       this.allowed = new Set((await state.storage.get('allowed')) || []);
       this.speak = new Set((await state.storage.get('speak')) || []);
       this.locked = !!(await state.storage.get('locked'));
-      this.ori = (await state.storage.get('ori')) === 'p' ? 'p' : 'l'; // arah papan: l = lanskap, p = potret
       this.seen = new Set((await state.storage.get('seen')) || []);
       this.banned = new Set((await state.storage.get('banned')) || []);
       this.ended = (await state.storage.get('ended')) || null; // {at, msg} bila guru mengakhiri kelas
       const pg = (await state.storage.get('pg')) || {}; this.page = pg.page || 0; this.npages = pg.npages || 1;
+      this.ori = (await state.storage.get('ori')) === 'p' ? 'p' : 'l'; // arah papan: l = landskap, p = potret
     });
   }
   async fetch(req) {
@@ -124,6 +124,7 @@ export class Room {
         ws.serializeAttachment(me); this.pushPeers(); break;
       case 'add':
         if (!ok || !m.it || this.hist.length > 20000) return;
+        if (m.it.k === 'v' && !(guru && (m.it.o === 'p' || m.it.o === 'l'))) return; // arah papan hanya boleh diatur guru
         this.hist.push(m.it); await this.saveSoon();
         this.all({ k: 'add', it: m.it, from: me.id }, ws); break;
       case 'pt': {
@@ -182,10 +183,10 @@ export class Room {
       case 'lock':
         if (!guru) return;
         this.locked = !!m.v; await this.s.storage.put('locked', this.locked); this.all({ k: 'lock', v: this.locked }); break;
-      case 'ori': // guru mengubah arah papan (lanskap/potret); semua peserta mengikuti
+      case 'ori': // guru mengatur arah papan; disimpan dan disiarkan ke semua peserta
         if (!guru || (m.v !== 'l' && m.v !== 'p')) return;
         this.ori = m.v; await this.s.storage.put('ori', this.ori);
-        this.all({ k: 'ori', v: this.ori }, ws); break;
+        this.all({ k: 'ori', v: this.ori, from: me.id }, ws); break;
       case 'pg': // guru berpindah halaman papan; semua peserta mengikuti
         if (!guru || !Number.isInteger(m.n) || m.n < 0 || m.n > 49) return;
         this.page = m.n; this.npages = Math.max(this.npages, m.n + 1);
