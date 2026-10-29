@@ -16,6 +16,7 @@ export class Room {
       this.locked = !!(await state.storage.get('locked'));
       this.seen = new Set((await state.storage.get('seen')) || []);
       this.banned = new Set((await state.storage.get('banned')) || []);
+      this.ended = (await state.storage.get('ended')) || null; // {at, msg} bila guru mengakhiri kelas
       const pg = (await state.storage.get('pg')) || {}; this.page = pg.page || 0; this.npages = pg.npages || 1;
     });
   }
@@ -32,13 +33,15 @@ export class Room {
     const refuse = code => { const [c2, s2] = Object.values(new WebSocketPair()); s2.accept(); s2.close(code, 'ditolak'); return new Response(null, { status: 101, webSocket: c2 }); };
     if (this.banned.has(id)) return refuse(4002);
     if (this.locked && role !== 'guru' && !this.seen.has(id)) return refuse(4001);
+    // Kelas berakhir: murid yang belum pernah masuk ditolak; yang sudah pernah masuk boleh melihat papan (hanya-baca).
+    if (this.ended && role !== 'guru' && !this.seen.has(id)) return refuse(4003);
     if (role !== 'guru' && !this.seen.has(id) && this.seen.size < 300) { this.seen.add(id); await this.s.storage.put('seen', [...this.seen]); }
     for (const x of this.s.getWebSockets()) if (x.deserializeAttachment().id === id) { try { x.close(4000, 'diganti'); } catch {} }
     const name = (u.searchParams.get('n') || 'Peserta').slice(0, 24);
     const [client, server] = Object.values(new WebSocketPair());
     this.s.acceptWebSocket(server);
     server.serializeAttachment({ id, name, role });
-    server.send(JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages }));
+    server.send(JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended }));
     this.pushPeers();
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -52,6 +55,7 @@ export class Room {
     }
     if (req.method !== 'POST') return new Response('Metode tidak didukung', { status: 405 });
     if (!this.teacher || req.headers.get('x-t') !== this.teacher) return new Response('Hanya guru yang boleh mengunggah', { status: 403 });
+    if (this.ended) return new Response('Kelas sudah berakhir', { status: 403 });
     const type = req.headers.get('content-type') || '';
     if (!/^image\/(jpeg|png|webp)$/.test(type)) return new Response('Jenis berkas tidak didukung', { status: 415 });
     const b = await req.arrayBuffer();
@@ -72,6 +76,8 @@ export class Room {
     if (typeof raw !== 'string' || raw.length > 30000) return;
     let m; try { m = JSON.parse(raw); } catch { return; }
     const me = ws.deserializeAttachment(), guru = me.role === 'guru', ok = guru || this.allowed.has(me.id);
+    // Setelah kelas diakhiri, papan hanya-baca: semua pesan selain ini diabaikan.
+    if (this.ended && !['hello', 'leave', 'reopen', 'end'].includes(m.k)) return;
     switch (m.k) {
       case 'hello':
         me.name = String(m.name || '').slice(0, 24) || me.name;
@@ -131,6 +137,24 @@ export class Room {
         this.page = m.n; this.npages = Math.max(this.npages, m.n + 1);
         await this.s.storage.put('pg', { page: this.page, npages: this.npages });
         this.all({ k: 'pg', n: m.n }, ws); break;
+      case 'end': { // guru mengakhiri kelas untuk semua: papan hanya-baca, suara diputus
+        if (!guru) return;
+        this.ended = { at: Date.now(), msg: String(m.msg || '').trim().slice(0, 140) };
+        await this.s.storage.put('ended', this.ended);
+        await this.s.storage.put('hist', this.hist);
+        for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a.v || a.h) { a.v = false; a.h = false; x.serializeAttachment(a); } }
+        this.all({ k: 'end', at: this.ended.at, msg: this.ended.msg });
+        this.pushPeers(); break; }
+      case 'reopen': { // guru membuka kembali kelas yang sudah diakhiri
+        if (!guru || !this.ended) return;
+        if (Number.isInteger(m.n) && m.n >= 0 && m.n < this.npages) { this.page = m.n; await this.s.storage.put('pg', { page: this.page, npages: this.npages }); }
+        this.ended = null; await this.s.storage.delete('ended');
+        this.all({ k: 'reopen', page: this.page, npages: this.npages }); break; }
+      case 'leave': { // murid keluar atas kemauan sendiri: guru diberi tahu, izin tetap tersimpan
+        if (!guru) for (const x of this.s.getWebSockets()) { if (x.deserializeAttachment().role === 'guru') { try { x.send(JSON.stringify({ k: 'note', t: 'leave', name: me.name })); } catch {} } }
+        me.v = false; me.h = false; ws.serializeAttachment(me);
+        try { ws.close(1000, 'keluar'); } catch {}
+        this.pushPeers(ws); break; }
       case 'sig': // dipakai Tahap 3 (suara): meneruskan pesan WebRTC ke satu peserta
         for (const w of this.s.getWebSockets()) {
           if (w.deserializeAttachment().id === m.to) w.send(JSON.stringify({ k: 'sig', from: me.id, data: m.data }));
