@@ -5,6 +5,8 @@ async function sha(s) {
   return [...new Uint8Array(b)].slice(0, 4).map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
+const MAX_ANTRE = 30; // paling banyak 30 murid menunggu persetujuan sekaligus per ruang
+
 export class Room {
   constructor(state, env) {
     this.s = state; this.env = env;
@@ -35,15 +37,46 @@ export class Room {
     if (this.locked && role !== 'guru' && !this.seen.has(id)) return refuse(4001);
     // Kelas berakhir: murid yang belum pernah masuk ditolak; yang sudah pernah masuk boleh melihat papan (hanya-baca).
     if (this.ended && role !== 'guru' && !this.seen.has(id)) return refuse(4003);
-    if (role !== 'guru' && !this.seen.has(id) && this.seen.size < 300) { this.seen.add(id); await this.s.storage.put('seen', [...this.seen]); }
+    // Persetujuan guru: murid yang belum pernah disetujui masuk antrean tunggu. Selama menunggu ia tidak
+    // menerima papan, tidak tampil bagi peserta lain, dan tidak bisa mengirim apa pun selain nama.
+    const wait = role !== 'guru' && !this.seen.has(id);
+    if (wait && this.waiters(id).length >= MAX_ANTRE) return refuse(4004);
     for (const x of this.s.getWebSockets()) if (x.deserializeAttachment().id === id) { try { x.close(4000, 'diganti'); } catch {} }
     const name = (u.searchParams.get('n') || 'Peserta').slice(0, 24);
     const [client, server] = Object.values(new WebSocketPair());
     this.s.acceptWebSocket(server);
-    server.serializeAttachment({ id, name, role });
-    server.send(JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended }));
-    this.pushPeers();
+    server.serializeAttachment({ id, name, role, wait });
+    if (wait) { server.send(JSON.stringify({ k: 'wait' })); this.pushQueue(); }
+    else { server.send(this.initMsg(id, role)); this.pushPeers(); if (role === 'guru') this.pushQueue(); }
     return new Response(null, { status: 101, webSocket: client });
+  }
+  initMsg(id, role) {
+    return JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended });
+  }
+  // Antrean tunggu: semua soket murid yang belum disetujui (kecuali satu id, bila diminta).
+  waiters(exceptId, except) {
+    return this.s.getWebSockets().filter(w => w !== except).map(w => w.deserializeAttachment()).filter(a => a && a.wait && a.id !== exceptId);
+  }
+  pushQueue(except) {
+    const list = this.waiters(null, except).map(a => ({ id: a.id, name: a.name }));
+    const j = JSON.stringify({ k: 'queue', list });
+    for (const w of this.s.getWebSockets()) if (w !== except) { const a = w.deserializeAttachment(); if (a && a.role === 'guru' && !a.wait) { try { w.send(j); } catch {} } }
+  }
+  // Terima murid dari antrean: baru sekarang ia dicatat sebagai "pernah masuk" dan menerima papan.
+  async admit(ids, guruWs) {
+    let n = 0, full = false;
+    for (const id of ids) for (const x of this.s.getWebSockets()) {
+      const a = x.deserializeAttachment();
+      if (!a || !a.wait || a.id !== id) continue;
+      if (this.banned.has(id)) continue;
+      if (this.seen.size >= 300) { full = true; continue; }
+      this.seen.add(id); a.wait = false; x.serializeAttachment(a); n++;
+      try { x.send(this.initMsg(id, a.role)); } catch {}
+    }
+    if (n) await this.s.storage.put('seen', [...this.seen]);
+    if (full) { try { guruWs.send(JSON.stringify({ k: 'note', t: 'full' })); } catch {} }
+    if (n) this.pushPeers();
+    this.pushQueue();
   }
   // Gambar kitab: disimpan terpisah dari riwayat papan (hanya guru yang boleh mengunggah).
   async img(req) {
@@ -66,16 +99,22 @@ export class Room {
     await this.s.storage.put('nimg', n + 1);
     return new Response('ok');
   }
-  peers(except) { return this.s.getWebSockets().filter(w => w !== except).map(w => w.deserializeAttachment()); }
+  peers(except) { return this.s.getWebSockets().filter(w => w !== except).map(w => w.deserializeAttachment()).filter(a => a && !a.wait); }
   pushPeers(except) { this.all({ k: 'peers', peers: this.peers(except) }); }
   all(m, except) {
     const j = JSON.stringify(m);
-    for (const w of this.s.getWebSockets()) if (w !== except) { try { w.send(j); } catch {} }
+    for (const w of this.s.getWebSockets()) if (w !== except && !w.deserializeAttachment().wait) { try { w.send(j); } catch {} }
   }
   async webSocketMessage(ws, raw) {
     if (typeof raw !== 'string' || raw.length > 30000) return;
     let m; try { m = JSON.parse(raw); } catch { return; }
     const me = ws.deserializeAttachment(), guru = me.role === 'guru', ok = guru || this.allowed.has(me.id);
+    // Murid yang masih menunggu persetujuan hanya boleh mengganti nama atau membatalkan.
+    if (me.wait) {
+      if (m.k === 'hello') { me.name = String(m.name || '').slice(0, 24) || me.name; ws.serializeAttachment(me); this.pushQueue(); }
+      else if (m.k === 'leave') { try { ws.close(1000, 'keluar'); } catch {} this.pushQueue(ws); }
+      return;
+    }
     // Setelah kelas diakhiri, papan hanya-baca: semua pesan selain ini diabaikan.
     if (this.ended && !['hello', 'leave', 'reopen', 'end'].includes(m.k)) return;
     switch (m.k) {
@@ -129,6 +168,16 @@ export class Room {
         }
         await this.s.storage.put('banned', [...this.banned]); await this.s.storage.put('allowed', [...this.allowed]); await this.s.storage.put('speak', [...this.speak]);
         this.all({ k: 'perm', allowed: [...this.allowed] }); this.all({ k: 'spk', allowed: [...this.speak] }); break; }
+      case 'admit': // guru menerima satu murid dari antrean
+        if (!guru || typeof m.id !== 'string') return;
+        await this.admit([m.id], ws); break;
+      case 'admitall': // guru menerima semua yang sedang menunggu
+        if (!guru) return;
+        await this.admit(this.waiters().map(a => a.id), ws); break;
+      case 'deny': // guru menolak satu murid dari antrean; ia boleh meminta lagi lewat muat ulang
+        if (!guru || typeof m.id !== 'string') return;
+        for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a && a.wait && a.id === m.id) { try { x.close(4005, 'ditolak guru'); } catch {} this.pushQueue(x); } }
+        break;
       case 'lock':
         if (!guru) return;
         this.locked = !!m.v; await this.s.storage.put('locked', this.locked); this.all({ k: 'lock', v: this.locked }); break;
@@ -142,7 +191,7 @@ export class Room {
         this.ended = { at: Date.now(), msg: String(m.msg || '').trim().slice(0, 140) };
         await this.s.storage.put('ended', this.ended);
         await this.s.storage.put('hist', this.hist);
-        for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a.v || a.h) { a.v = false; a.h = false; x.serializeAttachment(a); } }
+        for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a.wait) { try { x.close(4003, 'berakhir'); } catch {} continue; } if (a.v || a.h) { a.v = false; a.h = false; x.serializeAttachment(a); } }
         this.all({ k: 'end', at: this.ended.at, msg: this.ended.msg });
         this.pushPeers(); break; }
       case 'reopen': { // guru membuka kembali kelas yang sudah diakhiri
@@ -157,13 +206,13 @@ export class Room {
         this.pushPeers(ws); break; }
       case 'sig': // dipakai Tahap 3 (suara): meneruskan pesan WebRTC ke satu peserta
         for (const w of this.s.getWebSockets()) {
-          if (w.deserializeAttachment().id === m.to) w.send(JSON.stringify({ k: 'sig', from: me.id, data: m.data }));
+          const t = w.deserializeAttachment(); if (t.id === m.to && !t.wait) w.send(JSON.stringify({ k: 'sig', from: me.id, data: m.data }));
         } break;
     }
   }
   webSocketClose(ws) {
     try { ws.close(); } catch {}
-    this.pushPeers(ws);
+    this.pushPeers(ws); this.pushQueue(ws);
   }
   webSocketError(ws) { this.webSocketClose(ws); }
   async saveSoon() { if (!(await this.s.storage.getAlarm())) await this.s.storage.setAlarm(Date.now() + 5000); }
