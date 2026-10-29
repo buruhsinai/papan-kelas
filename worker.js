@@ -16,6 +16,7 @@ export class Room {
       this.allowed = new Set((await state.storage.get('allowed')) || []);
       this.speak = new Set((await state.storage.get('speak')) || []);
       this.locked = !!(await state.storage.get('locked'));
+      this.ori = (await state.storage.get('ori')) === 'p' ? 'p' : 'l'; // arah papan: l = lanskap, p = potret
       this.seen = new Set((await state.storage.get('seen')) || []);
       this.banned = new Set((await state.storage.get('banned')) || []);
       this.ended = (await state.storage.get('ended')) || null; // {at, msg} bila guru mengakhiri kelas
@@ -51,7 +52,7 @@ export class Room {
     return new Response(null, { status: 101, webSocket: client });
   }
   initMsg(id, role) {
-    return JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended });
+    return JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended, ori: this.ori });
   }
   // Antrean tunggu: semua soket murid yang belum disetujui (kecuali satu id, bila diminta).
   waiters(exceptId, except) {
@@ -181,6 +182,10 @@ export class Room {
       case 'lock':
         if (!guru) return;
         this.locked = !!m.v; await this.s.storage.put('locked', this.locked); this.all({ k: 'lock', v: this.locked }); break;
+      case 'ori': // guru mengubah arah papan (lanskap/potret); semua peserta mengikuti
+        if (!guru || (m.v !== 'l' && m.v !== 'p')) return;
+        this.ori = m.v; await this.s.storage.put('ori', this.ori);
+        this.all({ k: 'ori', v: this.ori }, ws); break;
       case 'pg': // guru berpindah halaman papan; semua peserta mengikuti
         if (!guru || !Number.isInteger(m.n) || m.n < 0 || m.n > 49) return;
         this.page = m.n; this.npages = Math.max(this.npages, m.n + 1);
