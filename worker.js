@@ -20,6 +20,8 @@ export class Room {
       this.banned = new Set((await state.storage.get('banned')) || []);
       this.ended = (await state.storage.get('ended')) || null; // {at, msg} bila guru mengakhiri kelas
       const pg = (await state.storage.get('pg')) || {}; this.page = pg.page || 0; this.npages = pg.npages || 1;
+      this.nav = new Set((await state.storage.get('nav')) || []); // murid yang boleh berpindah papan sendiri
+      this.pdf = (await state.storage.get('pdf')) || null; // {pg, total} bila PDF sedang tampil
       this.ori = (await state.storage.get('ori')) === 'p' ? 'p' : 'l'; // arah papan: l = landskap, p = potret
     });
   }
@@ -52,7 +54,7 @@ export class Room {
     return new Response(null, { status: 101, webSocket: client });
   }
   initMsg(id, role) {
-    return JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended, ori: this.ori });
+    return JSON.stringify({ k: 'init', you: id, role, hist: this.hist, allowed: [...this.allowed], speak: [...this.speak], locked: this.locked, page: this.page, npages: this.npages, ended: this.ended, ori: this.ori, nav: [...this.nav], pdf: this.pdf });
   }
   // Antrean tunggu: semua soket murid yang belum disetujui (kecuali satu id, bila diminta).
   waiters(exceptId, except) {
@@ -124,6 +126,7 @@ export class Room {
         ws.serializeAttachment(me); this.pushPeers(); break;
       case 'add':
         if (!ok || !m.it || this.hist.length > 20000) return;
+        if (!guru && (m.it.g || 0) !== this.page) return; // murid hanya menulis di papan yang sedang dipakai guru
         if (m.it.k === 'v' && !(guru && (m.it.o === 'p' || m.it.o === 'l'))) return; // arah papan hanya boleh diatur guru
         this.hist.push(m.it); await this.saveSoon();
         this.all({ k: 'add', it: m.it, from: me.id }, ws); break;
@@ -166,10 +169,10 @@ export class Room {
         if (!guru || typeof m.id !== 'string') return;
         for (const x of this.s.getWebSockets()) {
           const a = x.deserializeAttachment();
-          if (a.id === m.id && a.role !== 'guru') { this.banned.add(a.id); this.allowed.delete(a.id); this.speak.delete(a.id); try { x.close(4002, 'dikeluarkan'); } catch {} }
+          if (a.id === m.id && a.role !== 'guru') { this.banned.add(a.id); this.allowed.delete(a.id); this.speak.delete(a.id); this.nav.delete(a.id); try { x.close(4002, 'dikeluarkan'); } catch {} }
         }
-        await this.s.storage.put('banned', [...this.banned]); await this.s.storage.put('allowed', [...this.allowed]); await this.s.storage.put('speak', [...this.speak]);
-        this.all({ k: 'perm', allowed: [...this.allowed] }); this.all({ k: 'spk', allowed: [...this.speak] }); break; }
+        await this.s.storage.put('banned', [...this.banned]); await this.s.storage.put('allowed', [...this.allowed]); await this.s.storage.put('speak', [...this.speak]); await this.s.storage.put('nav', [...this.nav]);
+        this.all({ k: 'perm', allowed: [...this.allowed] }); this.all({ k: 'spk', allowed: [...this.speak] }); this.all({ k: 'nav', allowed: [...this.nav] }); break; }
       case 'admit': // guru menerima satu murid dari antrean
         if (!guru || typeof m.id !== 'string') return;
         await this.admit([m.id], ws); break;
@@ -180,6 +183,23 @@ export class Room {
         if (!guru || typeof m.id !== 'string') return;
         for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a && a.wait && a.id === m.id) { try { x.close(4005, 'ditolak guru'); } catch {} this.pushQueue(x); } }
         break;
+      case 'navperm': // guru mengatur siapa yang boleh berpindah papan sendiri; kosong = semua kembali mengikuti guru
+        if (!guru || !Array.isArray(m.allowed)) return;
+        this.nav = new Set(m.allowed.filter(x => typeof x === 'string').slice(0, 400));
+        await this.s.storage.put('nav', [...this.nav]);
+        this.all({ k: 'nav', allowed: [...this.nav] }); break;
+      case 'pdfst': // guru melaporkan PDF yang tampil (halaman sekarang dan jumlah halaman), atau mematikannya
+        if (!guru) return;
+        if (m.off) this.pdf = null;
+        else if (Number.isInteger(m.pg) && Number.isInteger(m.total) && m.total >= 1 && m.total <= 2000 && m.pg >= 1 && m.pg <= m.total) this.pdf = { pg: m.pg, total: m.total };
+        else return;
+        await this.s.storage.put('pdf', this.pdf);
+        this.all({ k: 'pdfst', pdf: this.pdf }, ws); break;
+      case 'pdfgo': { // murid yang boleh menulis atau bicara meminta halaman PDF tertentu; guru yang memuat halamannya
+        if (guru || !this.pdf || !(this.allowed.has(me.id) || this.speak.has(me.id))) return;
+        if (!Number.isInteger(m.n) || m.n < 1 || m.n > this.pdf.total) return;
+        for (const x of this.s.getWebSockets()) { const a = x.deserializeAttachment(); if (a && a.role === 'guru' && !a.wait) { try { x.send(JSON.stringify({ k: 'pdfgo', n: m.n, from: me.id })); } catch {} } }
+        break; }
       case 'lock':
         if (!guru) return;
         this.locked = !!m.v; await this.s.storage.put('locked', this.locked); this.all({ k: 'lock', v: this.locked }); break;
